@@ -2,6 +2,18 @@
 #include <Windows.h>
 #include <winternl.h>
 
+#define INITIAL_SEED 7
+
+#define HASHA(API) (HashStringJenkinsOneAtATime32BitA((PCHAR) API))
+
+
+typedef int (WINAPI* fnMessageBoxA)(
+    HWND hWnd,
+    LPCSTR lpText,
+    LPCSTR lpCaption,
+    UINT uType
+);
+
 /*
 * Helper function that takes two strings.
 * Converts them to lowercase and compares them.
@@ -39,7 +51,36 @@ BOOL IsStringEqual(IN LPCWSTR Str1, IN LPCWSTR Str2) {
 
 }
 
-FARPROC GetProcAddressReplacement(IN HMODULE hModule, IN LPCSTR lpApiName) {
+/*
+* `JenkinsOneAtATime32Bit` works by iterating over the characters of the input string,
+* ... and incrementally updating a running hash value according to the value for each character.
+* Uses ASCII.
+*/
+UINT32 HashStringJenkinsOneAtATime32BitA(IN PCHAR string) {
+
+    SIZE_T index = 0;
+    UINT32 hash = 0;
+    SIZE_T length = lstrlenA(string);
+
+    while (index != length) {
+        hash += string[index++];
+        hash += hash << INITIAL_SEED;
+        hash ^= hash >> 6;
+    }
+
+    hash += hash << 3;
+    hash ^= hash >> 11;
+    hash += hash << 15;
+
+    return hash;
+
+}
+
+/*
+* `dwApiNameHash` is the hash value of the function name
+* `hModule` is returned by GetModuleHandleH
+*/
+FARPROC GetProcAddressH(IN HMODULE hModule, IN DWORD dwApiNameHash) {
 
 	/*
 	* How `GetProcAddress` works:
@@ -103,12 +144,11 @@ FARPROC GetProcAddressReplacement(IN HMODULE hModule, IN LPCSTR lpApiName) {
 
         // get the name of the function
         CHAR* pFunctionName = (CHAR*)(pBase + FunctionNameArray[i]);
-
         // get the address of the function via its ordinal
         PVOID pFunctionAddress = (PVOID)(pBase + FunctionAddressArray[FunctionOrdinalArray[i]]);
 
-        // search for the function name specified
-        if (strcmp(lpApiName, pFunctionName) == 0) {
+        // search for the function hash specified
+        if (dwApiNameHash == HASHA(pFunctionName)) {
             printf("[ %0.4d ] FOUND API -\t NAME: %s -\t ADDRESS: 0x%p  -\t ORDINAL: %d\n", i, pFunctionName, pFunctionAddress, FunctionOrdinalArray[i]);
             return pFunctionAddress;
         }
@@ -121,7 +161,7 @@ FARPROC GetProcAddressReplacement(IN HMODULE hModule, IN LPCSTR lpApiName) {
 
 }
 
-HMODULE GetModuleHandleReplacementx64(IN LPCWSTR szModuleName) {
+HMODULE GetModuleHandleH(IN LPCWSTR dwModuleNameHash) {
 
     /*
     * How `GetModuleHandle` works:
@@ -142,16 +182,28 @@ HMODULE GetModuleHandleReplacementx64(IN LPCWSTR szModuleName) {
     // Search for the target module by name
     while (pDte) {
 
-        // if not null
-        if (pDte->FullDllName.Length != NULL) {
+        // if not null and not overflowing
+        if (pDte->FullDllName.Length != NULL && pDte->FullDllName.Length < MAX_PATH) {
 
-            // check if both equal
+            // convert `FullDllName.Buffer` to an uppercase string
+            CHAR UppercaseDllName[MAX_PATH];
+            DWORD i = 0;
+            while (pDte->FullDllName.Buffer[i]) {
+                UppercaseDllName[i] = (CHAR)toupper(pDte->FullDllName.Buffer[i]);
+                i++;
+            }
+            UppercaseDllName[i] = '\0';
+
+            if (dwModuleNameHash == HASHA(UppercaseDllName))
+                return (HMODULE)pDte->Reserved2[0];
+
+            /*// check if both equal
             if (IsStringEqual(pDte->FullDllName.Buffer, szModuleName)) {
                 wprintf(L"[+] Found DLL \"%s\"\n", pDte->FullDllName.Buffer);
                 // return handle to the DLL
                 return (HMODULE)pDte->Reserved2[0];
             }
-            //wprintf(L"[i]\"%s\"\n", pDte->FullDllName.Buffer);
+            //wprintf(L"[i]\"%s\"\n", pDte->FullDllName.Buffer);*/
 
         } else {
             break;
@@ -167,11 +219,37 @@ HMODULE GetModuleHandleReplacementx64(IN LPCWSTR szModuleName) {
 
 }
 
+// hard-coded hashes
+#define USER32DLL_HASH 0x81e3778e
+#define MessageBoxA_HASH 0xf10e27ca
+
 int main() {
 
-    printf("[i] Original 0x%p\n", GetModuleHandleW(L"NTDLL.DLL"));
+    //printf("hash of \"%s\" is: 0x%0.8x\n", "USER32.DLL", HASHA("USER32.DLL"));
+    //printf("hash of \"%s\" is: 0x%0.8x\n", "MessageBoxA", HASHA("MessageBoxA"));
 
-    printf("[i] Replacement 0x%p\n", GetModuleHandleReplacementx64(L"NTDLL.DLL"));
+    // load user32.dll to the current process so GetModuleHandleH still works
+    if (LoadLibraryA("USER32.DLL") == NULL) {
+        printf("[!} LoadLibraryA failed with error: %d\n", GetLastError());
+        return -1;
+    }
+
+    // get the handle of user32.dll using GetModuleHandleH
+    HMODULE hUser32Module = GetModuleHandleH(USER32DLL_HASH);
+    if (hUser32Module == NULL) {
+        printf("[!] Couldn't get the handle to user32.dll...\n");
+        return -1;
+    }
+
+    // get the address of MessageBoxA using GetProcAddressH
+    fnMessageBoxA pMessageBoxA = (fnMessageBoxA)GetProcAddressH(hUser32Module, MessageBoxA_HASH);
+    if (pMessageBoxA == NULL) {
+        printf("[!] Couldn't find address of specified function...\n");
+        return -1;
+    }
+
+    // call MessageBoxA
+    pMessageBoxA(NULL, "Hacking hacking hacking!", "Wow!", MB_OK | MB_ICONEXCLAMATION);
 
     printf("[#] Press <Enter> to quit...");
     getchar();
@@ -179,3 +257,16 @@ int main() {
     return 0;
 
 }
+
+/*int main() {
+
+    printf("[i] Original 0x%p\n", GetModuleHandleW(L"NTDLL.DLL"));
+
+    printf("[i] Replacement 0x%p\n", GetModuleHandleH(L"NTDLL.DLL"));
+
+    printf("[#] Press <Enter> to quit...");
+    getchar();
+
+    return 0;
+
+}*/
